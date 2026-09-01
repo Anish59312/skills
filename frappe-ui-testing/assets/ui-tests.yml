@@ -1,0 +1,191 @@
+# .github/workflows/ui-tests.yml
+#
+# Cypress UI tests for a custom Frappe app, for a repo that already runs Python unit tests in a
+# separate workflow. Replace every APP_NAME / SITE_NAME occurrence and the install step to match
+# your repo. See references/github-actions.md for what each part is doing and why.
+
+name: UI Tests
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+  schedule:
+    # Nightly at 00:00 UTC / 05:30 IST — catches breakage from frappe/erpnext develop.
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: ui-tests-${{ github.event_name }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  APP_NAME: my_app
+  SITE_NAME: test_site
+  BRANCH: ${{ github.base_ref || github.ref_name }}
+
+jobs:
+  changes:
+    name: Detect frontend changes
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - '**.js'
+              - '**.html'
+              - '**.css'
+              - '**.scss'
+              - '**/doctype/**/*.json'
+              - 'cypress/**'
+              - 'cypress.config.js'
+              - '.github/workflows/ui-tests.yml'
+
+  test:
+    name: Cypress (${{ matrix.container }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: changes
+    # Always run on push/schedule; on PRs only when something frontend-ish changed.
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.frontend == 'true' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        container: [1, 2]
+
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: travis
+        ports:
+          - 3306:3306
+        options: --health-cmd="mariadb-admin ping" --health-interval=5s --health-timeout=2s --health-retries=3
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          check-latest: true
+
+      - name: Add to Hosts
+        run: echo "127.0.0.1 ${{ env.SITE_NAME }}" | sudo tee -a /etc/hosts
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*requirements.txt', '**/pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache yarn
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: ${{ runner.os }}-yarn-
+
+      # The Cypress binary is ~250 MB and is downloaded on first `run-ui-tests`. Cache it.
+      - name: Cache cypress binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Cypress
+          key: ${{ runner.os }}-cypress
+
+      # Reuses the same helper the server-tests workflow uses. TYPE=ui tells it to build assets
+      # and wait for the web server — see references/github-actions.md for the required diff.
+      - name: Install
+        run: bash ${GITHUB_WORKSPACE}/.github/helper/install.sh
+        env:
+          BRANCH_TO_CLONE: ${{ env.BRANCH }}
+          TYPE: ui
+          DB: mariadb
+
+      - name: Site Setup
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench --site $SITE_NAME execute frappe.utils.install.complete_setup_wizard
+          bench --site $SITE_NAME execute frappe.tests.ui_test_helpers.create_test_user
+          bench --site $SITE_NAME set-password frappe@example.com admin
+          # App-specific fixtures (company, masters, settings). Create this function.
+          bench --site $SITE_NAME execute $APP_NAME.tests.ui_setup.execute
+
+      - uses: browser-actions/setup-chrome@latest
+      - run: echo "BROWSER_PATH=$(which chrome)" >> $GITHUB_ENV
+
+      - name: UI Tests
+        id: ui-tests
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench --site $SITE_NAME run-ui-tests $APP_NAME \
+            --headless \
+            --browser $BROWSER_PATH
+        env:
+          # Local sharding via the spec-partition logic in cypress.config.js.
+          # No Cypress Cloud account or record key needed.
+          SPLIT: ${{ strategy.job-total }}
+          SPLIT_INDEX: ${{ strategy.job-index }}
+
+      - name: Upload Cypress screenshots
+        if: ${{ failure() && steps.ui-tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-screenshots-${{ matrix.container }}
+          path: /home/runner/frappe-bench/apps/${{ env.APP_NAME }}/cypress/screenshots
+          if-no-files-found: ignore
+
+      - name: Upload Cypress videos
+        if: ${{ failure() && steps.ui-tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-videos-${{ matrix.container }}
+          path: /home/runner/frappe-bench/apps/${{ env.APP_NAME }}/cypress/videos
+          if-no-files-found: ignore
+
+      - name: Show bench output
+        if: ${{ always() }}
+        run: |
+          cat /home/runner/frappe-bench/bench_start.log || true
+          for f in /home/runner/frappe-bench/logs/*.log; do
+            echo "--- $f"; cat "$f" || true
+          done
+
+  # Require THIS check in branch protection, not the matrix jobs — the matrix job names change
+  # whenever you resize it, and a skipped matrix must still be able to pass.
+  success:
+    name: UI Success
+    needs: [test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check result
+        run: |
+          case "${{ needs.test.result }}" in
+            success|skipped) exit 0 ;;
+            *) exit 1 ;;
+          esac
